@@ -1,0 +1,9 @@
+"Model","Accuracy","Kappa","AUC"
+"Logistic Regression",75.5,51,80.11
+"Default Random Forest (RF1)",81.5,63,87.51
+"Tuned Random Forest (RF2)",81.73,63.47,87.46
+"Deep Random Forest (RF3)",81.5,63,87.42
+"Shallow Random Forest (RF4)",80.6,61.2,86.67
+"RF V2 (sqrt(p), RF5)",81.23,62.47,87.36
+"RF V3 (p/3, maxnodes=30, RF6)",78.1,56.2,84.03
+"Final Tuned Random Forest",81.8,63.6,87.48

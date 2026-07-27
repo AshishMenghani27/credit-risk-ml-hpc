@@ -1,0 +1,7 @@
+# Python / PySpark dependencies
+# Tested originally on Databricks Runtime 12.2 LTS (Spark 3.3.2, Python 3.9)
+pyspark==3.3.2
+pandas>=1.5
+matplotlib>=3.6
+scikit-learn>=1.2
+numpy>=1.23

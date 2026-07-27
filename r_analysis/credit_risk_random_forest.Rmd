@@ -1,0 +1,1111 @@
+---
+title: "Credit Risk Classification — Random Forest (R / caret)"
+author: "Ashish Menghani"
+date: "2025-05-01"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+-----------------------------------------
+INSTRUCTIONS TO RUN THIS R MARKDOWN FILE
+
+1) Install required libraries — see install_packages.R at the repo root.
+2) Download the full "Credit Score Classification" dataset from Kaggle
+   (Rohan Paris, 2022, CC BY 4.0):
+   https://www.kaggle.com/datasets/parisrohan/credit-score-classification
+   Place train.csv under data/raw/ at the REPO ROOT (not committed to this repo —
+   see data/sample/credit_risk_sample_200.csv for a 200-row preview of the
+   cleaned/encoded schema instead).
+3) Note: rmarkdown::render() knits with this file's own folder (r_analysis/) as
+   the working directory by default, not the repo root — that's why the paths
+   below start with "../". If you move this file, update the paths to match.
+4) Run the entire script sequentially. All intermediate CSV/PNG outputs are
+   written to the working directory (r_analysis/), matching the copies already
+   committed under results/.
+-----------------------------------------
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(ROCR)
+library(rpart)
+library(cluster)
+library(sampling)
+library(vcd)
+library(caret)
+library(corrplot)
+library(ggplot2)
+library(factoextra)
+library(tidyverse)
+library(pROC)
+library(pdp)
+library(dplyr)
+library(gridExtra)
+library(randomForest)
+
+set.seed(123)
+```
+
+```{r}
+#Importing the CSV file and eyeballing the data
+# Full 100,000-row raw dataset (Kaggle, CC BY 4.0) — download separately, see
+# instructions above. A 200-row cleaned/encoded sample is committed at
+# data/sample/credit_risk_sample_200.csv for reference.
+
+mydf <- read.csv("../data/raw/train.csv", na.strings = c("NA",""))
+summary(mydf)
+```
+
+```{r}
+# Data Cleaning
+
+# Converting categorical variables to factors
+categorical_cols <- c('Month', 'Name', 'Occupation', 'Type_of_Loan', 'Credit_Mix', 
+                      'Payment_of_Min_Amount', 'Payment_Behaviour', 'Credit_Score')
+
+mydf <- mydf %>%
+  mutate(across(all_of(categorical_cols), as.factor))
+
+# Handle special characters and invalid values in numeric columns
+# First, identify numeric columns
+numeric_cols <- mydf %>%
+  select(-all_of(categorical_cols), -ID, -Customer_ID, -SSN, -Credit_History_Age) %>%
+  names()
+
+#Replace any _ with empty strings
+mydf <- data.frame(lapply(mydf, function(x) gsub("_", "", x)))
+#fill the empty strings with NAs
+mydf <- data.frame(lapply(mydf, function(x) ifelse(x == "", NA, x)))
+
+# Clean credit history age (convert to months)
+mydf <- mydf %>%
+  mutate(
+    Credit_History_Age = str_replace_all(Credit_History_Age, "NA", ""),
+    Credit_History_Age = ifelse(Credit_History_Age == "", NA, Credit_History_Age),
+    Credit_History_Months = case_when(
+      grepl("Years and", Credit_History_Age) ~ 
+        as.numeric(str_extract(Credit_History_Age, "\\d+(?= Years)")) * 12 + 
+        as.numeric(str_extract(Credit_History_Age, "\\d+(?= Months)")),
+      grepl("Years", Credit_History_Age) ~ 
+        as.numeric(str_extract(Credit_History_Age, "\\d+")) * 12,
+      TRUE ~ NA_real_
+    )
+  )
+
+# Ensuring numerical variables are numeric
+mydf <- mydf %>%
+  mutate(across(all_of(numeric_cols), as.numeric))
+mydf <-  mydf %>%
+  mutate(across(all_of(categorical_cols), as.factor))
+
+#Cleaning the special characters and replacing it with NA values
+mydf <- mydf %>%
+  mutate(Payment_Behaviour = ifelse(as.character(Payment_Behaviour) == "!@9#%8", NA, as.character(Payment_Behaviour)),
+         Payment_Behaviour = factor(Payment_Behaviour))
+
+summary(mydf)
+```
+
+Creation of the target variable
+```{r}
+# Creating a new column for assessing Low or High Risk which supports our Research Question and will be our Target Variable
+mydf$Risk <- ifelse(mydf$Credit_Score == "Poor", "High", "Low")
+mydf$Risk <- as.factor(mydf$Risk)
+```
+
+Removing unnecessary features
+```{r}
+# Columns to remove ID, Customer ID, Name, SSN, Credit History Age(after converting to months) as they are redundant identifiers
+mydf <- mydf %>% select(-ID, -Customer_ID, -Name, -SSN, -Credit_History_Age, -Type_of_Loan, -Credit_Score)
+```
+
+```{r}
+# Substituting all numerical NA Values with median/mode (N Age Median, C Occupation Mode, N Monthly_Inhand_Salary, C Type_of_Loan,
+# N Num_of_Delayed_Payment, N Changed_Credit_Limit, N Num_Credit_Inquiries, C Credit_Mix, N Amount_invested_monthly,
+# C Payment_Behaviour, N Monthly_Balance, N Credit_History_Months)
+
+numeric_cols <- sapply(mydf, is.numeric)
+categorical_cols <- sapply(mydf, is.factor)
+
+mydf <- mydf %>%
+  mutate(
+    Age = ifelse(Age < 0 | Age > 120, NA, Age),
+    Num_Bank_Accounts = ifelse(Num_Bank_Accounts < 0, NA, Num_Bank_Accounts),
+    Num_of_Loan = ifelse(Num_of_Loan < 0, NA, Num_of_Loan),
+    Delay_from_due_date = ifelse(Delay_from_due_date < 0, NA, Delay_from_due_date),
+    Num_of_Delayed_Payment = ifelse(Num_of_Delayed_Payment < 0, NA, Num_of_Delayed_Payment),
+    Changed_Credit_Limit = ifelse(Changed_Credit_Limit < 0, NA, Changed_Credit_Limit)
+  )
+
+#Checking the percentage of NA values for the entire dataset
+mydf_NA_count <- apply(is.na(mydf), 2, sum)
+mydf_NA_perc <- mydf_NA_count / dim(mydf)[1] * 100
+mydf_NA_perc
+```
+
+```{r}
+# Median imputation for numeric features
+
+for (col_name in names(mydf)[numeric_cols]) {
+  # Replace NA values with the median of the column
+  mydf[[col_name]][is.na(mydf[[col_name]])] <- median(mydf[[col_name]], na.rm = TRUE)
+}
+
+#Checking the percentage of NA values for the entire dataset after removing NA values for the numerical variables
+mydf_NA_count <- apply(is.na(mydf), 2, sum)
+mydf_NA_perc <- mydf_NA_count / dim(mydf)[1] * 100
+mydf_NA_perc
+```
+
+```{r}
+# Mode imputation for categorical features
+Mode <- function(x) { ux <- unique(x[!is.na(x)]); ux[which.max(tabulate(match(x, ux)))] }
+for(col in names(mydf)[categorical_cols]) {
+  mode_val <- Mode(mydf[[col]])
+  mydf[[col]][is.na(mydf[[col]])] <- mode_val
+}
+
+#Checking the percentage of NA values for the entire dataset after removing NA values for the categorical variables
+mydf_NA_count <- apply(is.na(mydf), 2, sum)
+mydf_NA_perc <- mydf_NA_count / dim(mydf)[1] * 100
+mydf_NA_perc
+```
+
+```{r}
+# Outlier Detection
+
+# Defining a function to replace outliers with median
+replace_outliers_with_median <- function(data, column_name) {
+  outliers <- boxplot(data[[column_name]], plot = FALSE)$out
+  data[[column_name]] <- ifelse(data[[column_name]] %in% outliers, NA, data[[column_name]])
+  data[[column_name]][is.na(data[[column_name]])] <- median(data[[column_name]], na.rm = TRUE)
+  print(summary(data[[column_name]]))
+  return(data)
+}
+
+# Apply the function to all relevant numerical columns
+columns_to_process <- c(
+  "Num_Bank_Accounts", "Num_Credit_Card", "Interest_Rate", "Num_of_Loan",
+  "Num_of_Delayed_Payment", "Num_Credit_Inquiries", "Total_EMI_per_month",
+  "Amount_invested_monthly", "Annual_Income"
+)
+
+for (col in columns_to_process) {
+  mydf <- replace_outliers_with_median(mydf, col)
+}
+
+summary(mydf)
+```
+
+------------------------------------------------------
+Exploratory Data Analysis
+
+```{r}
+#Plotting target variable to understand class imbalance
+
+risk_plot <- ggplot(mydf, aes(x = Risk, fill = Risk)) +
+  geom_bar() +
+  scale_fill_manual(values = c("High" = "red", "Low" = "green")) +
+  labs(title = "Distribution of Risk Categories",
+       x = "Risk Level",
+       y = "Count") +
+  theme_minimal()
+print(risk_plot)
+```
+
+```{r}
+#Checking the correlation between all the numerical variables to understand multicollinearity using correlation matrix
+cor.matrix <- cor(mydf[numeric_cols])
+cor.matrix
+```
+
+```{r}
+#Plotting a Mosaic Plot for understanding the relationship between Risk and Credit Mix as both are categorical variables
+mosaic(~ Credit_Mix + Risk, data = mydf,
+       shade = TRUE, legend = TRUE,
+       labeling_args = list(set_varnames = c(Credit_Mix = "Credit Mix", Risk = "Risk")))
+```
+
+```{r}
+# Understanding the range of Annual Income for both Risk types using boxplot
+boxplot(Annual_Income ~ Risk, data = mydf, 
+        col = c("red", "green"),
+        main = "Annual Income by Credit Risk",
+        xlab = "Credit Risk",
+        ylab = "Annual Income",
+        border = "black")
+
+```
+
+To understand the relationship between Months and Risk, which turned out to be insignificant which resulted in removing the Month feature
+```{r}
+chisq.test(mydf$Month,mydf$Risk)
+mydf <- mydf %>% select(-Month)
+```
+
+Understanding the trend of Risk across different Age groups
+```{r}
+AgeGroup <- cut(mydf$Age,
+                   breaks = c(-Inf, 25, 35, 45, 60, Inf),
+                   labels = c("Under 25", "25-35", "36-45", "46-60", "60+"))
+ggplot(mydf, aes(x = AgeGroup, fill = Risk)) +
+  geom_bar(position = "fill") +
+  theme_classic()+
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Distribution of Risk accross Age Groups", y = "Proportion", x = "Payment Behaviour") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+```
+
+Correlation Heatmap for all numerical variables to understand the strength of the relationship between them.
+```{r}
+corr_data <- cor(mydf %>% select_if(is.numeric))
+corrplot(corr_data, method = "color", type = "upper")
+```
+
+So removing the least correlated numerical variables which are expected to make no significant contribution to the model and would increase the complexity.
+```{r}
+mydf <- mydf %>% select(-Age, -Monthly_Balance, -Credit_Utilization_Ratio)
+```
+
+
+-----------------------
+ENCODING
+
+Checking if the categorical variables are significant enough to stay or we would remove them. One-Hot encoding is preferred as the models will treat the
+numerically labeled values as ordinal variables.
+```{r}
+#Will have One-Hot encoding
+table(mydf$Payment_of_Min_Amount,mydf$Risk)
+chisq.test(mydf$Payment_of_Min_Amount,mydf$Risk)
+```
+
+```{r}
+#Will have One-Hot encoding
+table(mydf$Payment_Behaviour,mydf$Risk)
+chisq.test(mydf$Payment_Behaviour,mydf$Risk)
+```
+
+```{r}
+#Will have One-Hot encoding
+table(mydf$Occupation,mydf$Risk)
+chisq.test(mydf$Occupation,mydf$Risk)
+```
+
+```{r}
+#Will have One-Hot encoding
+table(mydf$Credit_Mix,mydf$Risk)
+chisq.test(mydf$Credit_Mix,mydf$Risk)
+```
+
+```{r}
+
+#Encoding values for Risk, Occupation, Credit_mix, Payment_Behaviour, Payment_of_Min_Amount
+mydf$Risk <- factor(mydf$Risk, levels = c("Low", "High"))
+# create a numeric version: Low → 0, High → 1
+mydf$Risk <- as.integer(mydf$Risk) - 1
+mydf$Risk <- as.factor(mydf$Risk)
+
+# Ensure the selected columns are factors
+mydf$Occupation <- as.factor(mydf$Occupation)
+mydf$Credit_Mix <- as.factor(mydf$Credit_Mix)
+mydf$Payment_Behaviour <- as.factor(mydf$Payment_Behaviour)
+mydf$Payment_of_Min_Amount <- as.factor(mydf$Payment_of_Min_Amount)
+
+# Create one-hot encoded variables
+occupation_dummies <- model.matrix(~ Occupation - 1, data = mydf)
+creditmix_dummies <- model.matrix(~ Credit_Mix - 1, data = mydf)
+paymentbehaviour_dummies <- model.matrix(~ Payment_Behaviour - 1, data = mydf)
+paymentminamount_dummies <- model.matrix(~ Payment_of_Min_Amount - 1, data = mydf)
+
+# Combine the dummy variables with the original dataframe (excluding the original categorical columns)
+mydf <- cbind(
+  mydf[ , !(names(mydf) %in% c("Occupation", "Credit_Mix", "Payment_Behaviour", "Payment_of_Min_Amount"))],
+  occupation_dummies,
+  creditmix_dummies,
+  paymentbehaviour_dummies,
+  paymentminamount_dummies
+)
+
+
+str(mydf)
+```
+-----------------------
+Sampling
+
+Based on the EDA observation, there was a noticeable class imbalance. To mitigate this we have used stratified sampling to divide the Risk class in equal proportions.
+The below code is divided into 5000 rows each Risk type to reduce modelling training time and computational cost.
+```{r}
+mydf$ID <- 1:nrow(mydf)
+set.seed(123)
+#----------------------
+#This commented code was used to extract the csv file for HPCI implementation where 28998 rows were extracted for 0 and 1 risk types
+#stratified_sample <- strata(mydf, stratanames = "Risk", size = rep(28998, length(unique(mydf$Risk))), method = "srswor")
+#mydf_ready <- mydf[stratified_sample$ID_unit, ]
+#mydf_ready <- mydf_ready %>% select(-ID)
+#write.csv(mydf_ready,"HPCI_Cleaned_Data.csv")
+#----------------------
+stratified_sample <- strata(mydf, stratanames = "Risk", size = rep(5000, length(unique(mydf$Risk))), method = "srswor")
+mydf_ready <- mydf[stratified_sample$ID_unit, ]
+mydf_ready <- mydf_ready %>% select(-ID)
+
+#Checking the proportions
+prop.table(table(mydf_ready$Risk))
+```
+
+-----------------------
+PCA for Dimensionality Reduction
+
+```{r}
+pca_result <- prcomp(mydf_ready %>% select_if(is.numeric) , center=T ,scale. = TRUE)
+summary(pca_result)
+```
+PCA Loadings
+```{r}
+plot(pca_result)
+```
+
+Proportion of Explained Variance that would help identifying the ideal number of PCs which explains the most of the variance in our dataset.
+```{r}
+pca_result_var <- pca_result$sdev^2
+pca_result_PEV <- pca_result_var / sum(pca_result_var)
+
+# plot the cumulative value of PEV for increasing number of additional PCs
+#   note: add an 80% threshold line to inform the feature extraction
+#     according to the plot the first 3 PCs should be selected
+opar <- par(no.readonly = TRUE)
+plot(
+  cumsum(pca_result_PEV),
+  ylim = c(0,1),
+  xlab = 'PC',
+  ylab = 'Cumulative PEV',
+  #pch = 20,
+  col = 'orange'
+)
+abline(h = 0.8, col = 'red', lty = 'dashed')
+par(opar)
+```
+
+-------------
+Clustering
+
+We are going with K-means as the dataset has a large number of features.
+
+```{r}
+# Elbow Method to determine optimal number of clusters
+fviz_nbclust(pca_result$x, kmeans, method = "wss", k.max = 10) +
+  labs(title = "Elbow Method for Optimal K") +
+  theme_classic()
+```
+
+```{r}
+#We are going for values 2 and 3 for the K as the elbow method shows Sharp drop from k=1 → k=2. Big reduction in within-cluster sum of squares.
+#Better smoother decline from k=2 → k=3. Still some reduction, but less sharp.
+pca_dis <- pca_result$x
+distance <- dist(pca_dis, method='euclidean')
+k_means_result1 <- kmeans(pca_dis, 3)
+k_means_result_id1 <- k_means_result1$cluster
+k_means_sil1 <- cluster::silhouette(k_means_result_id1, distance)
+plot(k_means_sil1, col = "red", border = NA, main = "Silhouette Plot", cex.names = 0.6)
+```
+
+Going. with 2 clusters
+```{r}
+k_means_result2 <- kmeans(pca_dis, 2)
+k_means_result_id2 <- k_means_result2$cluster
+k_means_sil2 <- cluster::silhouette(k_means_result_id2, distance)
+plot(k_means_sil2, col = "red", border = NA, main = "Silhouette Plot", cex.names = 0.6)
+```
+Decided to go with 2 as the Average Silhoutte Width is better.
+-----------------------
+Train/Test Split
+
+Going with the Hold-out method of splitting the data into 70-30 proportions having an equal distribution of Risk factors in each set.
+```{r}
+# Make sure Risk is a factor
+mydf_ready$Risk <- factor(mydf_ready$Risk)
+
+# Calculate proportional class counts for training set (70%)
+train_props <- prop.table(table(mydf_ready$Risk)) * floor(0.7 * nrow(mydf_ready))
+train_props <- round(train_props)
+names(train_props) <- levels(mydf_ready$Risk)  # Ensure names match factor levels
+
+# Stratified sampling: get training indices
+set.seed(42)  # for reproducibility
+train_indices <- unlist(
+  lapply(levels(mydf_ready$Risk), function(risk_level) {
+    rows_in_class <- which(mydf_ready$Risk == risk_level)
+    sample(rows_in_class, train_props[[risk_level]])
+  })
+)
+
+# Create train/test sets
+train_set <- mydf_ready[train_indices, ]
+test_set <- mydf_ready[-train_indices, ]
+
+# Check class balance
+cat("Training set distribution:\n")
+print(table(train_set$Risk))
+cat("Test set distribution:\n")
+print(table(test_set$Risk))
+
+```
+
+```{r}
+# Since the pre-processing, sampling and cleaning is done. Verifying the entire dataset before proceeding with modelling.
+str(train_set)
+str(test_set)
+```
+
+# Random Forest Model Section
+
+```{r}
+# setting levels for Risk
+levels(train_set$Risk) <- c("High", "Low")
+levels(test_set$Risk) <- c("High", "Low")
+```
+
+
+Part 1: Benchmark Supporting Model (Logistic Regression)
+A logistic regression model was built on the cleaned dataset to establish a baseline for performance evaluation. As a straightforward, interpretable linear classifier, it established a preliminary benchmark for accuracy and AUC. Evaluation criteria were documented using a confusion matrix and ROC curve to assess enhancements from more sophisticated models.
+
+1. Logistic Regression: logit_model
+
+```{r}
+# Train Logistic Regression
+set.seed(42)
+logit_model <- glm(Risk ~ ., data = train_set, family = "binomial")
+
+```
+
+```{r}
+# Predict and evaluate
+logit_probs <- predict(logit_model, test_set, type = "response")
+logit_pred <- ifelse(logit_probs > 0.5, "Low", "High")  # Assuming 1 = "Low" (positive)
+logit_pred <- factor(logit_pred, levels = c("High", "Low"))  # Match factor levels
+
+# Confusion Matrix
+confusionMatrix(logit_pred, test_set$Risk)
+
+# AUC
+roc_logit <- roc(test_set$Risk, logit_probs)
+cat("Logistic Regression AUC:", auc(roc_logit), "\n")
+
+```
+
+
+Part 2: Multiple Random Forest Model Experiments (RF1–RF6) (testing & tuning)
+
+Six Random Forest models were developed to explore the effects of different hyperparameter configurations:
+
+RF1 (Default): Basic model using default settings.
+
+RF2 (Tuned): Cross-validated model using caret with a tuned mtry parameter.
+
+RF3 (Deep): Larger trees (low nodesize, more depth).
+
+RF4 (Shallow): Smaller trees (higher nodesize, limited depth).
+
+RF5 (V2): Manual setup using mtry = sqrt(p) and ntree = 1000.
+
+RF6 (V3): Custom forest using mtry = p/3 and maxnodes = 30.
+
+All models were evaluated using accuracy, confusion matrix, and AUC on the same test set. These comparisons helped identify the setup that optimally balanced complexity, performance, and generality.
+
+1: RF1: Basic Random Forest (Default Random Forest)
+
+```{r}
+# RF1: Basic Random Forest
+set.seed(42)
+rf_default <- randomForest(Risk ~ ., data = train_set, ntree = 500, importance = TRUE)
+```
+
+2: RF2: Tuned Random Forest (Tuned Random Forest using caret)
+
+```{r}
+# RF2: Tuned Random Forest
+set.seed(42)
+
+# Define 5-fold cross-validation
+control <- trainControl(method="cv", number=5, classProbs=TRUE, summaryFunction=twoClassSummary)
+
+# Grid for mtry values
+rf_grid <- expand.grid(mtry = c(2, 4, 6, 8, 10, 12))
+
+# Train
+rf_tuned <- train(
+  Risk ~ ., 
+  data = train_set, 
+  method = "rf", 
+  metric = "ROC", 
+  trControl = control, 
+  tuneGrid = rf_grid, 
+  ntree = 500
+)
+
+# best mtry value selected
+cat("Best mtry value selected by cross-validation:\n")
+print(rf_tuned$bestTune)
+
+# ROC performance for each mtry value
+cat("\nFull cross-validation results:\n")
+print(rf_tuned$results)
+```
+
+3: RF3: Deeper Trees (Deeper Random Forest - bigger trees)
+
+```{r}
+# RF3: Deeper Trees
+set.seed(42)
+rf_deep <- randomForest(
+  Risk ~ ., 
+  data = train_set, 
+  ntree = 1000, 
+  mtry = 8,          # Adjusting value based on best mtry from RF2
+  nodesize = 2, 
+  importance = TRUE
+)
+```
+
+4: RF4: Shallow Trees (Shallow Random Forest - smaller trees)
+
+```{r}
+# RF4: Shallow Trees
+set.seed(42)
+rf_shallow <- randomForest(
+  Risk ~ ., 
+  data = train_set, 
+  ntree = 300, 
+  mtry = 4, 
+  nodesize = 10, 
+  importance = TRUE
+)
+```
+
+5: RF5: Build RF_V2 (1000 trees, mtry = sqrt(p))
+
+```{r}
+# RF5: RF_V2 (1000 trees, mtry = sqrt(p))
+set.seed(42)
+rf_v2 <- randomForest(Risk ~ ., data = train_set, ntree = 1000, mtry = floor(sqrt(ncol(train_set) - 1)))
+```
+
+6: RF6: Build RF_V3 (1000 trees, mtry = p/3, maxnodes = 30)
+
+```{r}
+# RF6: RF_V3 (1000 trees, mtry = p/3, maxnodes = 30)
+set.seed(42)
+rf_v3 <- randomForest(Risk ~ ., data = train_set, ntree = 1000, mtry = floor((ncol(train_set) - 1) / 3), maxnodes = 30)
+```
+
+Predict on Test Set for Each Model
+
+```{r}
+# Predictions
+pred_default  <- predict(rf_default, test_set)
+pred_tuned    <- predict(rf_tuned, test_set)
+pred_deep     <- predict(rf_deep, test_set)
+pred_shallow  <- predict(rf_shallow, test_set)
+pred_v2       <- predict(rf_v2, test_set)
+pred_v3       <- predict(rf_v3, test_set)
+
+```
+
+Evaluate Performance: Accuracy, Confusion Matrix
+
+```{r}
+# Confusion Matrices
+confusionMatrix(pred_default, reference = test_set$Risk)
+confusionMatrix(pred_tuned, reference = test_set$Risk)
+confusionMatrix(pred_deep, reference = test_set$Risk)
+confusionMatrix(pred_shallow, reference = test_set$Risk)
+confusionMatrix(pred_v2, reference = test_set$Risk)
+confusionMatrix(pred_v3, reference = test_set$Risk)
+
+```
+
+ROC AUC Calculations
+
+```{r}
+# Probabilities for AUC
+probs_default  <- predict(rf_default, test_set, type = "prob")[, 2]
+probs_tuned    <- predict(rf_tuned, test_set, type = "prob")[, 2]
+probs_deep     <- predict(rf_deep, test_set, type = "prob")[, 2]
+probs_shallow  <- predict(rf_shallow, test_set, type = "prob")[, 2]
+probs_v2       <- predict(rf_v2, test_set, type = "prob")[, 2]
+probs_v3       <- predict(rf_v3, test_set, type = "prob")[, 2]
+
+# ROC Curves
+roc_default  <- roc(test_set$Risk, probs_default)
+roc_tuned    <- roc(test_set$Risk, probs_tuned)
+roc_deep     <- roc(test_set$Risk, probs_deep)
+roc_shallow  <- roc(test_set$Risk, probs_shallow)
+roc_v2       <- roc(test_set$Risk, probs_v2)
+roc_v3       <- roc(test_set$Risk, probs_v3)
+
+# Print AUCs
+cat("RF1 (Default) AUC:", auc(roc_default), "\n")
+cat("RF2 (Tuned) AUC:", auc(roc_tuned), "\n")
+cat("RF3 (Deep) AUC:", auc(roc_deep), "\n")
+cat("RF4 (Shallow) AUC:", auc(roc_shallow), "\n")
+cat("RF5 (V2) AUC:", auc(roc_v2), "\n")
+cat("RF6 (V3) AUC:", auc(roc_v3), "\n")
+
+```
+
+Part 3: Final Tuned Random Forest Model
+A final model was chosen and trained utilising insights from RF2 and other variants.Caret with 5-fold cross-validation with ntree set to 1000 was used for this model. The finalised model underwent comprehensive evaluation.
+
+Metrics: Accuracy, Area Under the Curve (AUC), precision, recall, F1 score.
+
+Visuals: ROC curves, feature importance (both Gini and Accuracy), and ROC overlays for comparative model analysis.
+
+Results: All outputs are saved in CSV and PNG formats for documentation and reproducibility.
+
+Final Random Forest Model
+
+```{r}
+
+# Set seed for reproducibility
+set.seed(42)
+
+# 5-fold cross-validation setup
+control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# Grid of mtry values to test
+rf_grid <- expand.grid(mtry = c(2, 4, 6, 8, 10, 12))
+
+# Train the tuned Random Forest model
+rf_final <- train(
+  Risk ~ ., 
+  data = train_set, 
+  method = "rf", 
+  metric = "ROC", 
+  trControl = control, 
+  tuneGrid = rf_grid, 
+  ntree = 1000
+)
+
+# Best mtry value selected
+cat("Best mtry value selected by cross-validation:\n")
+print(rf_final$bestTune)
+
+# ROC performance for each mtry value
+cat("\nFull cross-validation results:\n")
+print(rf_final$results)
+
+# Plot ROC vs mtry (optional)
+ggplot(rf_final$results, aes(x = mtry, y = ROC)) +
+  geom_line(color = "blue") +
+  geom_point(color = "darkgreen") +
+  labs(title = "ROC vs mtry",
+       x = "mtry (Number of Variables Tried at Each Split)",
+       y = "ROC Score") +
+  theme_minimal()
+
+write.csv(rf_final$results, "rf_cv_results.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Predict
+pred_final   <- predict(rf_final, test_set)
+```
+
+
+```{r}
+# Accuracy and confusion matrices
+levels(test_set$Risk)
+
+confusionMatrix(pred_final, reference = test_set$Risk)
+
+cm <- confusionMatrix(pred_final, reference = test_set$Risk)
+write.csv(as.data.frame(cm$table), "rf_confusion_matrix.csv", row.names = FALSE)
+
+# Extract overall and class metrics
+overall_metrics <- as.data.frame(t(cm$overall))
+colnames(overall_metrics) <- paste0("Overall_", colnames(overall_metrics))
+
+class_metrics <- as.data.frame(t(cm$byClass))
+colnames(class_metrics) <- paste0("Class_", colnames(class_metrics))
+
+# Combine all
+all_metrics <- cbind(overall_metrics, class_metrics)
+
+# Save all to CSV
+write.csv(all_metrics, "rf_full_evaluation_metrics.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Probabilities for AUC
+probs_final  <- predict(rf_final, test_set, type = "prob")[, 2]
+
+# ROC Curve and AUC
+roc_final  <- roc(test_set$Risk, probs_final)
+auc_val <- auc(roc_final)
+cat("RF (Final) AUC:", round(auc_val, 4), "\n")
+
+# Predict class labels
+pred_final <- predict(rf_final, test_set)
+
+# Confusion matrix
+cm <- confusionMatrix(pred_final, reference = test_set$Risk)
+
+# Extract metrics
+precision <- cm$byClass["Pos Pred Value"]
+recall    <- cm$byClass["Sensitivity"]
+f1_score  <- 2 * (precision * recall) / (precision + recall)
+
+# Print to console
+cat("Precision:", round(precision, 4), "\n")
+cat("Recall:", round(recall, 4), "\n")
+cat("F1 Score:", round(f1_score, 4), "\n")
+
+# Save all metrics into a data frame
+metrics_df <- data.frame(
+  AUC = round(auc_val, 4),
+  Precision = round(precision, 4),
+  Recall = round(recall, 4),
+  F1_Score = round(f1_score, 4)
+)
+
+# Write to CSV
+write.csv(metrics_df, "rf_final_metrics.csv", row.names = FALSE)
+
+```
+
+ROC Curve with pROC
+
+```{r}
+# Predict Probabilities
+rf_probs <- predict(rf_final, newdata = test_set, type = "prob")[,2]
+
+# Compute ROC Curve
+rf_roc <- roc(test_set$Risk, rf_probs)
+
+# Plot ROC Curve
+plot(rf_roc, col = "blue", main = "ROC Curve - Random Forest")
+
+# AUC
+auc_value <- auc(rf_roc)
+print(auc_value)
+
+png("roc_curve_rf_final.png", width = 1200, height = 800)
+plot(rf_roc, col = "blue", main = "ROC Curve - Random Forest")
+dev.off()
+
+```
+
+Top 10 Feature Importance (with Both Accuracy & Gini)
+
+```{r}
+
+# Feature Importance
+varImpPlot(rf_deep)
+
+# rf_deep trained with importance = TRUE
+importance_values <- importance(rf_deep)
+
+# Create Dataframe (inc. both importance metrics)
+importance_df <- data.frame(
+  Feature = rownames(importance_values),
+  MeanDecreaseAccuracy = importance_values[, "MeanDecreaseAccuracy"],
+  MeanDecreaseGini = importance_values[, "MeanDecreaseGini"]
+)
+
+# Top 10 by both criteria
+top10_acc <- importance_df[order(-importance_df$MeanDecreaseAccuracy), ][1:10, ]
+top10_gini <- importance_df[order(-importance_df$MeanDecreaseGini), ][1:10, ]
+
+# Print tables
+print(top10_acc)
+print(top10_gini)
+
+# Print tables
+write.csv(top10_acc, "rf_top10_features_acc.csv", row.names = FALSE)
+write.csv(top10_gini, "rf_top10_features_gini.csv", row.names = FALSE)
+
+p1 <- ggplot(top10_acc, aes(x = reorder(Feature, MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Top 10 Features by Accuracy", x = "Feature", y = "Mean Decrease Accuracy") +
+  theme_minimal()
+
+p2 <- ggplot(top10_gini, aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 10 Features by Gini", x = "Feature", y = "Mean Decrease Gini") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+
+ggsave("feature_importance_accuracy.png", plot = p1, width = 8, height = 6)
+ggsave("feature_importance_gini.png", plot = p2, width = 8, height = 6)
+
+```
+
+ROCR Style Plot
+
+```{r}
+# Probabilities and labels
+rf_probs_rocr <- predict(rf_final, test_set, type = "prob")[, "Low"]
+labels_numeric <- ifelse(test_set$Risk == "Low", 1, 0)
+
+# Create ROCR objects
+rf_pred_rocr <- prediction(predictions = rf_probs_rocr, labels = labels_numeric)
+rf_perf_rocr <- performance(rf_pred_rocr, measure = "tpr", x.measure = "fpr")
+
+# Save ROC plot to PNG
+png("rf_roc_curve_rocr.png", width = 1200, height = 800)
+
+plot(rf_perf_rocr,
+     col = "blue",
+     lwd = 2,
+     main = "ROC Curve using ROCR - Tuned Random Forest",
+     xlab = "False Positive Rate",
+     ylab = "True Positive Rate")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+# Add AUC legend
+rf_auc_rocr <- performance(rf_pred_rocr, measure = "auc")
+auc_value_tuned <- rf_auc_rocr@y.values[[1]]
+legend("bottomright", legend = paste("AUC =", round(auc_value_tuned, 4)), col = "blue", lwd = 2)
+
+dev.off()
+
+# Export ROC points to CSV
+fpr <- rf_perf_rocr@x.values[[1]]
+tpr <- rf_perf_rocr@y.values[[1]]
+rf_roc_df <- data.frame(FPR = fpr, TPR = tpr)
+write.csv(rf_roc_df, "rf_final_roc_curve.csv", row.names = FALSE)
+
+```
+
+
+Export ROC Curve DataFrame for CSV
+
+```{r}
+fpr <- rf_perf_rocr@x.values[[1]]
+tpr <- rf_perf_rocr@y.values[[1]]
+
+rf_roc_df <- data.frame(FPR = fpr, TPR = tpr)
+write.csv(rf_roc_df, "RF_final_ROC_df.csv", row.names = FALSE)
+
+```
+
+Final Comparison Table
+
+```{r}
+# Final Comparison Table (Including rf_final)
+
+grand_final_all <- data.frame(
+  Model = c(
+    "Logistic Regression",
+    "Default Random Forest (RF1)",
+    "Tuned Random Forest (RF2)",
+    "Deep Random Forest (RF3)",
+    "Shallow Random Forest (RF4)",
+    "RF V2 (sqrt(p), RF5)",
+    "RF V3 (p/3, maxnodes=30, RF6)",
+    "Final Tuned Random Forest"
+  ),
+  Accuracy = c(0.7550, 0.8150, 0.8173, 0.8150, 0.8060, 0.8123, 0.7810, 0.8180) * 100,
+  Kappa = c(0.5100, 0.6300, 0.6347, 0.6300, 0.6120, 0.6247, 0.5620, 0.6360) * 100,
+  AUC = c(0.8011, 0.8751, 0.8746, 0.8742, 0.8667, 0.8736, 0.8403, 0.8748) * 100
+)
+print(grand_final_all)
+write.csv(grand_final_all, "grand_final_comparison_all_models.csv", row.names = FALSE)
+
+```
+GRAND FINAL COMPARISON BARPLOTS
+
+```{r}
+# GRAND FINAL COMPARISON BARPLOTS
+
+# Pivot to long format for plotting
+grand_final_long <- grand_final_all %>%
+  pivot_longer(cols = c("Accuracy", "Kappa", "AUC"), 
+               names_to = "Metric", values_to = "Value")
+
+# Plot
+ggplot(grand_final_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  geom_text(aes(label = paste0(round(Value, 1), "%")), 
+            position = position_dodge(width = 0.8), vjust = -0.25, size = 3) +
+  labs(title = "Comparison of Models: Accuracy, Kappa, and AUC (%)",
+       y = "Percentage (%)", x = "Model") +
+  scale_y_continuous(limits = c(0, 100)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save
+ggsave("grand_final_comparison_plot.png", width = 12, height = 6, dpi = 300)
+
+```
+
+```{r}
+
+# List of ROC objects from previous models
+roc_list <- list(
+  Logistic = roc_logit,
+  RF1_Default = roc_default,
+  RF2_Tuned = roc_tuned,
+  RF3_Deep = roc_deep,
+  RF4_Shallow = roc_shallow,
+  RF5_V2 = roc_v2,
+  RF6_V3 = roc_v3,
+  RF_Final = roc_final
+)
+
+# Update colors and line types (match length and order)
+model_colors <- c(
+  "Logistic" = "steelblue",
+  "RF1_Default" = "blue",
+  "RF2_Tuned" = "darkgreen",
+  "RF3_Deep" = "purple",
+  "RF4_Shallow" = "orange",
+  "RF5_V2" = "red",
+  "RF6_V3" = "brown",
+  "RF_Final" = "black"
+)
+
+model_lty <- c(1, 1, 2, 3, 4, 5, 6, 1)
+
+# Plot ROC comparison
+plot(roc_list[[1]], col = model_colors[1], lwd = 2, main = "ROC Curves: All Models", legacy.axes = TRUE)
+for (i in 2:length(roc_list)) {
+  lines(roc_list[[i]], col = model_colors[i], lwd = 2, lty = model_lty[i])
+}
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+legend("bottomright", 
+       legend = paste0(names(roc_list), " (AUC = ", 
+                       sapply(roc_list, function(r) round(auc(r), 3)), ")"),
+       col = model_colors, 
+       lty = model_lty, 
+       lwd = 2, 
+       cex = 0.8)
+
+# Save to PNG
+png("all_models_roc_comparison.png", width = 1400, height = 1000)
+plot(roc_list[[1]], col = model_colors[1], lwd = 2, main = "ROC Curves: All Models", legacy.axes = TRUE)
+for (i in 2:length(roc_list)) {
+  lines(roc_list[[i]], col = model_colors[i], lwd = 2, lty = model_lty[i])
+}
+abline(a = 0, b = 1, lty = 2, col = "gray")
+legend("bottomright", 
+       legend = paste0(names(roc_list), " (AUC = ", 
+                       sapply(roc_list, function(r) round(auc(r), 3)), ")"),
+       col = model_colors, 
+       lty = model_lty, 
+       lwd = 2, 
+       cex = 0.8)
+dev.off()
+
+```
+
+```{r}
+# Exporting all model AUCs
+model_aucs <- data.frame(
+  Model = names(roc_list),
+  AUC = sapply(roc_list, function(r) round(auc(r), 4))
+)
+write.csv(model_aucs, "all_model_auc_scores.csv", row.names = FALSE)
+
+# Show table in document
+print(model_aucs)
+
+```
+
+-----------------------
+Statistical Significance Check (DeLong's Test) — added for this repo
+
+The written report (Section 6.2) cites DeLong's test for several AUC comparisons, including
+a cross-platform check (R Random Forest vs. Spark Random Forest: z = 3.67, p < 0.001). That
+specific comparison spans two different held-out samples (3,000 rows in R vs. ~17,400 in
+Spark) and its underlying script was not preserved among the submitted materials, so it is
+reported in this repo's README as a documented finding rather than re-executed here.
+
+What *is* fully reproducible end-to-end in this file is a paired DeLong test on the two
+models that share the identical `test_set`: the Final Tuned Random Forest against the
+Logistic Regression baseline.
+
+```{r}
+# DeLong's test: Final Random Forest vs. Logistic Regression baseline
+# (paired — both evaluated on the same held-out test_set)
+delong_result <- roc.test(roc_logit, roc_final, method = "delong")
+print(delong_result)
+
+cat(sprintf(
+  "\nRandom Forest AUC (%.4f) vs. Logistic Regression AUC (%.4f): DeLong z = %.3f, p = %.2e\n",
+  auc(roc_final), auc(roc_logit), delong_result$statistic, delong_result$p.value
+))
+```
+
+-----------------------
+
+```{r}
+
+# Decision Tree, SVM (Poly/RBF), and SOM were built independently by other members of the
+# graduate group coursework project (see the dissertation's Author Contribution Statement); their ROC
+# data is included here only to reproduce the cross-algorithm comparison chart below.
+# This repo's own contribution is the Random Forest model (R + PySpark), in this file and
+# in pyspark_analysis/.
+rf_df <- read.csv("../results/roc_data/random_forest_roc.csv")
+tree_df <- read.csv("../results/roc_data/decision_tree_roc.csv")
+svm_poly_df <- read.csv("../results/roc_data/svm_polynomial_roc.csv")
+som_df <- read.csv("../results/roc_data/som_roc.csv")
+svm_rbf_df <- read.csv("../results/roc_data/svm_rbf_roc.csv")
+
+# Define colors and line types
+model_colors <- c("black", "red", "blue", "purple", "darkgreen")
+model_lty <- c(1, 2, 3, 4, 5)
+model_labels <- c("Random Forest", "Decision Tree", "SVM Polydot", "SOM", "SVM RBFdot")
+
+# Plot setup
+plot(rf_df$FPR, rf_df$TPR, type = "l", col = model_colors[1], lwd = 2, lty = model_lty[1],
+     xlab = "False Positive Rate", ylab = "True Positive Rate",
+     main = "Model Comparison: ROC Curves", xlim = c(0,1), ylim = c(0,1))
+
+# Add other models
+lines(tree_df$FPR, tree_df$TPR, col = model_colors[2], lwd = 2, lty = model_lty[2])
+lines(svm_poly_df$FPR, svm_poly_df$TPR, col = model_colors[3], lwd = 2, lty = model_lty[3])
+lines(som_df$FPR, som_df$TPR, col = model_colors[4], lwd = 2, lty = model_lty[4])
+lines(svm_rbf_df$FPR, svm_rbf_df$TPR, col = model_colors[5], lwd = 2, lty = model_lty[5])
+
+# Add reference line
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+# Add legend
+legend("bottomright", legend = model_labels,
+       col = model_colors, lty = model_lty, lwd = 2, cex = 0.85)
+
+# Save to PNG
+png("model_comparison_roc_curves.png", width = 1400, height = 1000)
+plot(rf_df$FPR, rf_df$TPR, type = "l", col = model_colors[1], lwd = 2, lty = model_lty[1],
+     xlab = "False Positive Rate", ylab = "True Positive Rate",
+     main = "Model Comparison: ROC Curves", xlim = c(0,1), ylim = c(0,1))
+lines(tree_df$FPR, tree_df$TPR, col = model_colors[2], lwd = 2, lty = model_lty[2])
+lines(svm_poly_df$FPR, svm_poly_df$TPR, col = model_colors[3], lwd = 2, lty = model_lty[3])
+lines(som_df$FPR, som_df$TPR, col = model_colors[4], lwd = 2, lty = model_lty[4])
+lines(svm_rbf_df$FPR, svm_rbf_df$TPR, col = model_colors[5], lwd = 2, lty = model_lty[5])
+abline(a = 0, b = 1, lty = 2, col = "gray")
+legend("bottomright", legend = model_labels,
+       col = model_colors, lty = model_lty, lwd = 2, cex = 0.85)
+dev.off()
+
+```
+
+
+
+

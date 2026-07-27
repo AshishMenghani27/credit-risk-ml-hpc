@@ -1,0 +1,58 @@
+# --- Raw / large data (never commit — see README for download instructions) ---
+data/raw/
+*.csv.bak
+HPCI_Cleaned_Data.csv
+train.csv
+test.csv
+
+# --- R Markdown knit output (regenerated in r_analysis/ when the .Rmd is re-run —
+# that folder should only ever contain the source .Rmd; everything else here is
+# a reproducible-on-demand artifact, already committed with clearer names under results/) ---
+r_analysis/*.csv
+r_analysis/*.png
+r_analysis/*.html
+r_analysis/*.md
+r_analysis/*.log
+r_analysis/*_cache/
+r_analysis/*_files/
+
+# --- R artifacts ---
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+*.Rproj.user/
+renv/library/
+renv/local/
+renv/staging/
+
+# --- Python artifacts ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+*.pyc
+
+# --- Spark / Databricks ---
+metastore_db/
+derby.log
+spark-warehouse/
+*.dbc
+
+# --- OS junk ---
+.DS_Store
+__MACOSX/
+Thumbs.db
+
+# --- Editor ---
+.vscode/
+.idea/
+
+# --- Confidentiality safety net ---
+# If any of the following are ever accidentally staged, they must be removed
+# before commit — see GIT_SETUP_COMMANDS.sh for the pre-commit grep check.
+# (Left here as documentation, not as an active ignore pattern, since these
+# are content strings rather than filenames.)
+# 1836076, K21194535, CS5811, CS5710, Brightspace
