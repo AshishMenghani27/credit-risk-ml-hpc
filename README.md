@@ -7,8 +7,7 @@
 
 Hybrid single-node (R / caret) and distributed (Apache Spark MLlib) credit-risk
 classification, benchmarked head-to-head on 100,000 financial records — engineered
-to quantify the accuracy/speed trade-off between a high-fidelity audit model and a
-horizontally-scalable production model.
+to quantify the accuracy/speed trade-off between a high-fidelity audit model and a horizontally-scalable distributed model.
 
 ---
 
@@ -124,8 +123,7 @@ the tuned Random Forest against the Logistic Regression baseline
 
 **Efficiency frontier**: R's caret-tuned Random Forest sits on the accuracy vertex
 (highest AUC, slowest to retrain); Spark's MLlib Random Forest sits on the speed
-vertex (4.2× faster, ~2.9 AUC points lower). Practical read: use Spark for frequent
-(e.g. daily) production refreshes, and reserve the R pipeline for periodic
+vertex (4.2× faster, ~2.9 AUC points lower). Practical read: use Spark for frequent (e.g. daily) retraining, and reserve the R pipeline for periodic
 high-fidelity audits — a threshold each institution can set from its own cost of
 capital vs. cost of a stale model.
 
